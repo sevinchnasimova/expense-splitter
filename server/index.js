@@ -1,0 +1,202 @@
+const express = require('express');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const { PrismaClient } = require('@prisma/client');
+const authMiddleware = require('./authMiddleware');
+require('dotenv').config();
+
+const app = express();
+const prisma = new PrismaClient();
+const PORT = 3000;
+
+app.use(express.json());
+
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
+app.post('/api/auth/signup', async (req, res) => {
+  const { email, password } = req.body;
+  const passwordHash = await bcrypt.hash(password, 10);
+
+  const user = await prisma.user.create({
+    data: { email, passwordHash },
+  });
+
+  res.json({ id: user.id, email: user.email });
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  const user = await prisma.user.findUnique({ where: { email } });
+  if (!user) {
+    return res.status(401).json({ error: 'Invalid email or password' });
+  }
+
+  const passwordMatches = await bcrypt.compare(password, user.passwordHash);
+  if (!passwordMatches) {
+    return res.status(401).json({ error: 'Invalid email or password' });
+  }
+
+  const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+  res.json({ token });
+});
+
+// Create a group (creator is automatically added as a member)
+app.post('/api/groups', authMiddleware, async (req, res) => {
+  const { name } = req.body;
+
+  const group = await prisma.group.create({
+    data: {
+      name: name,
+      members: {
+        create: [{ userId: req.userId }],
+      },
+    },
+    include: { members: true },
+  });
+
+  res.json(group);
+});
+
+// List groups the logged-in user belongs to
+app.get('/api/groups', authMiddleware, async (req, res) => {
+  const memberships = await prisma.groupMember.findMany({
+    where: { userId: req.userId },
+    include: { group: true },
+  });
+
+  const groups = memberships.map(m => m.group);
+  res.json(groups);
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+});
+
+// Add a member to a group (by email)
+app.post('/api/groups/:groupId/members', authMiddleware, async (req, res) => {
+    const groupId = parseInt(req.params.groupId);
+    const { email } = req.body;
+
+    const userToAdd = await prisma.user.findUnique({ where: { email } });
+    if (!userToAdd) {
+        return res.status(404).json({ error: 'No user with that email' });
+    }
+
+    const membership = await prisma.groupMember.create({
+        data: {
+            userId: userToAdd.id,
+            groupId: groupId
+        },
+    });
+
+    res.json(membership);
+});
+
+// Log an expense, split evenly among all group members
+app.post('/api/groups/:groupId/expenses', authMiddleware, async (req, res) => {
+  const groupId = parseInt(req.params.groupId);
+  const { amount, description, category, date } = req.body;
+
+  const members = await prisma.groupMember.findMany({
+    where: { groupId: groupId },
+  });
+
+  const splitAmount = amount / members.length;
+
+  const expense = await prisma.expense.create({
+    data: {
+      groupId: groupId,
+      paidById: req.userId,
+      amount: amount,
+      description: description,
+      category: category || 'Other',
+      date: new Date(date),
+      splits: {
+        create: members.map(member => ({
+          userId: member.userId,
+          amount: splitAmount,
+        })),
+      },
+    },
+    include: { splits: true },
+  });
+
+  res.json(expense);
+});
+
+app.get('/api/groups/:groupId/balances', authMiddleware, async (req, res) => {
+  const groupId = parseInt(req.params.groupId);
+
+  const expenses = await prisma.expense.findMany({
+    where: { groupId: groupId },
+    include: { splits: true },
+  });
+
+  const balances = {};
+
+  for (const expense of expenses) {
+    balances[expense.paidById] = (balances[expense.paidById] || 0) + expense.amount;
+
+    for (const split of expense.splits) {
+      balances[split.userId] = (balances[split.userId] || 0) - split.amount;
+    }
+  }
+
+  res.json(balances);
+});
+
+app.get('/api/groups/:groupId/settle', authMiddleware, async (req, res) => {
+  const groupId = parseInt(req.params.groupId);
+
+  const expenses = await prisma.expense.findMany({
+    where: { groupId: groupId },
+    include: { splits: true },
+  });
+
+  const balances = {};
+  for (const expense of expenses) {
+    balances[expense.paidById] = (balances[expense.paidById] || 0) + expense.amount;
+    for (const split of expense.splits) {
+      balances[split.userId] = (balances[split.userId] || 0) - split.amount;
+    }
+  }
+
+  // Split people into "owes money" and "is owed money"
+  const debtors = [];   // negative balance
+  const creditors = []; // positive balance
+
+  for (const userId in balances) {
+    const amount = Math.round(balances[userId] * 100) / 100; // avoid floating point weirdness
+    if (amount < 0) debtors.push({ userId: parseInt(userId), amount: -amount });
+    if (amount > 0) creditors.push({ userId: parseInt(userId), amount: amount });
+  }
+
+  const transactions = [];
+
+  while (debtors.length > 0 && creditors.length > 0) {
+    debtors.sort((a, b) => b.amount - a.amount);
+    creditors.sort((a, b) => b.amount - a.amount);
+
+    const debtor = debtors[0];
+    const creditor = creditors[0];
+
+    const settledAmount = Math.min(debtor.amount, creditor.amount);
+
+    transactions.push({
+      from: debtor.userId,
+      to: creditor.userId,
+      amount: Math.round(settledAmount * 100) / 100,
+    });
+
+    debtor.amount -= settledAmount;
+    creditor.amount -= settledAmount;
+
+    if (debtor.amount < 0.01) debtors.shift();
+    if (creditor.amount < 0.01) creditors.shift();
+  }
+
+  res.json(transactions);
+});
